@@ -426,19 +426,22 @@ class Lz4HadoopCodec : public Lz4Codec {
 
   int64_t MaxCompressedLen(int64_t input_len,
                            const uint8_t* ARROW_ARG_UNUSED(input)) override {
-    return kPrefixLength + Lz4Codec::MaxCompressedLen(input_len, nullptr);
+    return kHadoopLz4PrefixLength + kHadoopLz4InnerBlockPrefixLength +
+           Lz4Codec::MaxCompressedLen(input_len, nullptr);
   }
 
   Result<int64_t> Compress(int64_t input_len, const uint8_t* input,
                            int64_t output_buffer_len, uint8_t* output_buffer) override {
-    if (output_buffer_len < kPrefixLength) {
+    if (output_buffer_len < kHadoopLz4PrefixLength + kHadoopLz4InnerBlockPrefixLength) {
       return Status::Invalid("Output buffer too small for Lz4HadoopCodec compression");
     }
 
     ARROW_ASSIGN_OR_RAISE(
         int64_t output_len,
-        Lz4Codec::Compress(input_len, input, output_buffer_len - kPrefixLength,
-                           output_buffer + kPrefixLength));
+        Lz4Codec::Compress(
+            input_len, input,
+            output_buffer_len - kHadoopLz4PrefixLength - kHadoopLz4InnerBlockPrefixLength,
+            output_buffer + kHadoopLz4PrefixLength + kHadoopLz4InnerBlockPrefixLength));
 
     // Prepend decompressed size in bytes and compressed size in bytes
     // to be compatible with Hadoop Lz4Codec
@@ -449,7 +452,7 @@ class Lz4HadoopCodec : public Lz4Codec {
     SafeStore(output_buffer, decompressed_size);
     SafeStore(output_buffer + sizeof(uint32_t), compressed_size);
 
-    return kPrefixLength + output_len;
+    return kHadoopLz4PrefixLength + kHadoopLz4InnerBlockPrefixLength + output_len;
   }
 
   Result<std::shared_ptr<Compressor>> MakeCompressor() override {
@@ -468,7 +471,8 @@ class Lz4HadoopCodec : public Lz4Codec {
 
  protected:
   // Offset starting at which page data can be read/written
-  static const int64_t kPrefixLength = sizeof(uint32_t) * 2;
+  static const int64_t kHadoopLz4PrefixLength = sizeof(uint32_t);
+  static const int64_t kHadoopLz4InnerBlockPrefixLength = sizeof(uint32_t);
 
   static const int64_t kNotHadoop = -1;
 
@@ -477,42 +481,72 @@ class Lz4HadoopCodec : public Lz4Codec {
     // Parquet files written with the Hadoop Lz4Codec use their own framing.
     // The input buffer can contain an arbitrary number of "frames", each
     // with the following structure:
-    // - bytes 0..3: big-endian uint32_t representing the frame decompressed size
-    // - bytes 4..7: big-endian uint32_t representing the frame compressed size
-    // - bytes 8...: frame compressed data
+    // <outer block 0>
+    //   - 4 bytes big-endian uint32_t representing all inner block's decompressed size
+    //    <inner block 0>
+    //        - bytes 0..3: big-endian uint32_t representing the inner block compressed
+    //        size
+    //        - bytes 4...: the inner block compressed data
+    //    <inner block 1>
+    //        ...
+    //    <inner block n>
+    //        ...
+    // <outer block 1>
+    //    ...
+    // <outer block n>
+    //    ... repeated until input is consumed ...
     //
     // The Hadoop Lz4Codec source code can be found here:
     // https://github.com/apache/hadoop/blob/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-nativetask/src/main/native/src/codec/Lz4Codec.cc
     int64_t total_decompressed_size = 0;
 
-    while (input_len >= kPrefixLength) {
-      const uint32_t expected_decompressed_size =
-          bit_util::FromBigEndian(SafeLoadAs<uint32_t>(input));
-      const uint32_t expected_compressed_size =
-          bit_util::FromBigEndian(SafeLoadAs<uint32_t>(input + sizeof(uint32_t)));
-      input += kPrefixLength;
-      input_len -= kPrefixLength;
+    while (input_len > 0) {
+      if (input_len < kHadoopLz4PrefixLength) {
+        return kNotHadoop;
+      }
 
-      if (input_len < expected_compressed_size) {
-        // Not enough bytes for Hadoop "frame"
-        return kNotHadoop;
+      // Read all inner block's decompressed size
+      uint32_t decompressed_block_len =
+          bit_util::FromBigEndian(SafeLoadAs<uint32_t>(input));
+      input += kHadoopLz4PrefixLength;
+      input_len -= kHadoopLz4PrefixLength;
+      if (input_len <= 0) {
+        break;
       }
-      if (output_buffer_len < expected_decompressed_size) {
-        // Not enough bytes to hold advertised output => probably not Hadoop
-        return kNotHadoop;
-      }
-      // Try decompressing and compare with expected decompressed length
-      auto maybe_decompressed_size = Lz4Codec::Decompress(
-          expected_compressed_size, input, output_buffer_len, output_buffer);
-      if (!maybe_decompressed_size.ok() ||
-          *maybe_decompressed_size != expected_decompressed_size) {
-        return kNotHadoop;
-      }
-      input += expected_compressed_size;
-      input_len -= expected_compressed_size;
-      output_buffer += expected_decompressed_size;
-      output_buffer_len -= expected_decompressed_size;
-      total_decompressed_size += expected_decompressed_size;
+
+      do {
+        if (input_len < kHadoopLz4InnerBlockPrefixLength) {
+          return kNotHadoop;
+        }
+
+        // Read compressed size of inner block
+        const uint32_t expected_compressed_size =
+            bit_util::FromBigEndian(SafeLoadAs<uint32_t>(input));
+        input += kHadoopLz4InnerBlockPrefixLength;
+        input_len -= kHadoopLz4InnerBlockPrefixLength;
+
+        if (expected_compressed_size == 0) {
+          continue;
+        }
+
+        if (input_len < expected_compressed_size) {
+          // Not enough bytes for Hadoop "frame"
+          return kNotHadoop;
+        }
+        int64_t remaining_output_size = output_buffer_len - total_decompressed_size;
+
+        auto maybe_decompressed_size = Lz4Codec::Decompress(
+            expected_compressed_size, input, remaining_output_size, output_buffer);
+        if (!maybe_decompressed_size.ok()) {
+          return kNotHadoop;
+        }
+        input += expected_compressed_size;
+        input_len -= expected_compressed_size;
+        auto decompressed_size = *maybe_decompressed_size;
+        output_buffer += decompressed_size;
+        decompressed_block_len -= decompressed_size;
+        total_decompressed_size += decompressed_size;
+      } while (decompressed_block_len > 0);
     }
 
     if (input_len == 0) {
